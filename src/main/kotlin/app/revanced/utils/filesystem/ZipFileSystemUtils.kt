@@ -1,3 +1,5 @@
+@file:Suppress("MemberVisibilityCanBePrivate")
+
 package app.revanced.utils.filesystem
 
 import java.io.Closeable
@@ -5,60 +7,73 @@ import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.StandardCopyOption
 import java.util.zip.ZipEntry
 
-internal class ZipFileSystemUtils(
-    file: File
-) : Closeable {
-    private var zipFileSystem = FileSystems.newFileSystem(file.toPath(), mapOf("noCompression" to true))
+internal class ZipFileUtils(zipFile: File) : Closeable {
+    private var fileSystem = FileSystems.newFileSystem(zipFile.toPath(), mapOf("noCompression" to true))
 
-    private fun Path.deleteRecursively() {
-        if (!Files.exists(this)) {
-            throw IllegalStateException("File exists in real folder but not in zip file system")
+    /**
+     * Get a path to a file in the zip file system.
+     *
+     * @param path The path to the file.
+     * @return The path to the file.
+     */
+    fun getFsPath(path: String): Path = fileSystem.getPath(path)
+
+    /**
+     * Delete files in the zip file system.
+     *
+     * @param paths The paths to the files.
+     */
+    fun decompress(vararg paths: String) =
+        paths.forEach { Files.setAttribute(getFsPath(it), "zip:method", ZipEntry.STORED) }
+
+    /**
+     * Delete a file or path recursively from the zip file.
+     *
+     * @param path The path to delete.
+     * @throws IllegalArgumentException If the path does not exist.
+     */
+    fun delete(path: String) {
+        fun deleteRecursively(path: Path) {
+            path.also {
+                if (Files.isDirectory(it)) Files.list(it).forEach(::deleteRecursively)
+            }.let(Files::delete)
         }
 
-        if (Files.isDirectory(this)) {
-            Files.list(this).forEach { path ->
-                path.deleteRecursively()
-            }
-        }
-
-        Files.delete(this)
+        getFsPath(path).also {
+            if (Files.exists(it)) return@also
+            throw IllegalStateException("File does not exist in the current file system")
+        }.let(::deleteRecursively)
     }
 
-    internal fun getFile(path: String) = zipFileSystem.getPath(path)
-
-    internal fun writePathRecursively(path: Path) {
-        Files.list(path).use { fileStream ->
-            fileStream.forEach { filePath ->
-                val fileSystemPath = filePath.getRelativePath(path)
-                fileSystemPath.deleteRecursively()
-            }
+    /**
+     * Write a file to the zip file.
+     *
+     * @param fromPath The path to the file to write.
+     */
+    fun write(fromPath: Path) {
+        Files.list(fromPath).forEach { path ->
+            // delete files that already exist in the zip file root directory
+            path.toString().let(::delete)
         }
 
-        Files.walk(path).use { fileStream ->
-            // don't include build directory
-            // by skipping the root node.
-            fileStream.skip(1).forEach { filePath ->
-                val relativePath = filePath.getRelativePath(path)
-
-                if (Files.isDirectory(filePath)) {
-                    Files.createDirectory(relativePath)
-                    return@forEach
-                }
-
-                Files.copy(filePath, relativePath)
+        Files.walk(fromPath).skip(1).forEach { path ->
+            getFsPath(path.toString()).also { toPath ->
+                if (Files.isDirectory(path)) Files.createDirectories(toPath)
+                else Files.copy(path, toPath, StandardCopyOption.REPLACE_EXISTING)
             }
         }
     }
 
-    internal fun write(path: String, content: ByteArray) = Files.write(zipFileSystem.getPath(path), content)
+    /**
+     * Write a file to the zip file.
+     *
+     * @param path The path to write the [content] to.
+     * @param content The content to write.
+     */
+    internal fun write(path: String, content: ByteArray) = Files.write(getFsPath(path), content)
 
-    private fun Path.getRelativePath(path: Path): Path = zipFileSystem.getPath(path.relativize(this).toString())
-
-    // TODO: figure out why the file system is uncompressed by default and how to fix it
-    internal fun uncompress(vararg paths: String) =
-        paths.forEach { Files.setAttribute(zipFileSystem.getPath(it), "zip:method", ZipEntry.STORED) }
-
-    override fun close() = zipFileSystem.close()
+    override fun close() = fileSystem.close()
 }

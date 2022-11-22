@@ -1,33 +1,33 @@
 package app.revanced.utils.patcher
 
 import app.revanced.cli.command.MainCommand
-import app.revanced.cli.command.MainCommand.args
 import app.revanced.cli.command.MainCommand.logger
+import app.revanced.patcher.Context
 import app.revanced.patcher.Patcher
-import app.revanced.patcher.data.Context
+import app.revanced.patcher.apk.Apk
 import app.revanced.patcher.extensions.PatchExtensions.compatiblePackages
 import app.revanced.patcher.extensions.PatchExtensions.include
 import app.revanced.patcher.extensions.PatchExtensions.patchName
 import app.revanced.patcher.patch.Patch
 
-fun Patcher.addPatchesFiltered(allPatches: List<Class<out Patch<Context>>>) {
-    val packageName = this.context.packageMetadata.packageName
-    val packageVersion = this.context.packageMetadata.packageVersion
+fun Patcher.addPatchesFiltered(allPatches: List<Class<out Patch<Context>>>, baseApk: Apk.Base) {
+    val packageName = baseApk.packageMetadata.packageName
+    val packageVersion = baseApk.packageMetadata.packageVersion
 
     val includedPatches = mutableListOf<Class<out Patch<Context>>>()
     allPatches.forEach patchLoop@{ patch ->
         val compatiblePackages = patch.compatiblePackages
         val patchName = patch.patchName
 
-        val prefix = "Skipping $patchName, reason"
+        val prefix = "Skipping $patchName:"
 
         val args = MainCommand.args.patchArgs?.patchingArgs!!
 
         if (args.excludedPatches.contains(patchName)) {
-            logger.info("$prefix: manually excluded")
+            logger.info("$prefix manually excluded")
             return@patchLoop
         } else if ((!patch.include || args.defaultExclude) && !args.includedPatches.contains(patchName)) {
-            logger.info("$prefix: excluded by default")
+            logger.info("$prefix excluded by default")
             return@patchLoop
         }
 
@@ -56,21 +56,4 @@ fun Patcher.addPatchesFiltered(allPatches: List<Class<out Patch<Context>>>) {
     }
 
     this.addPatches(includedPatches)
-}
-
-fun Patcher.applyPatchesVerbose() {
-    this.executePatches().forEach { (patch, result) ->
-        if (result.isSuccess) {
-            logger.info("$patch succeeded")
-            return@forEach
-        }
-        logger.error("$patch failed:")
-        result.exceptionOrNull()!!.printStackTrace()
-    }
-}
-
-fun Patcher.mergeFiles() {
-    this.addFiles(args.patchArgs?.patchingArgs!!.mergeFiles) { file ->
-        logger.info("Merging $file")
-    }
 }

@@ -21,7 +21,37 @@ import java.util.*
 internal class Signer(
     private val signingOptions: SigningOptions
 ) {
+    private val signer: ApkSigner.Builder
     private val passwordCharArray = signingOptions.password.toCharArray()
+
+    init {
+        Security.addProvider(BouncyCastleProvider())
+
+        val keyStore = KeyStore.getInstance("BKS", "BC")
+        val alias = keyStore.let { store ->
+            FileInputStream(File(signingOptions.keyStoreFilePath).also {
+                if (!it.exists()) {
+                    logger.info("Creating keystore at ${it.absolutePath}")
+                    newKeystore(it)
+                } else {
+                    logger.info("Using keystore at ${it.absolutePath}")
+                }
+            }).use { fis -> store.load(fis, null) }
+            store.aliases().nextElement()
+        }
+
+        with(
+            ApkSigner.SignerConfig.Builder(
+                signingOptions.cn,
+                keyStore.getKey(alias, passwordCharArray) as PrivateKey,
+                listOf(keyStore.getCertificate(alias) as X509Certificate)
+            ).build()
+        ) {
+            this@Signer.signer = ApkSigner.Builder(listOf(this))
+            signer.setCreatedBy(signingOptions.cn)
+        }
+    }
+
     private fun newKeystore(out: File) {
         val (publicKey, privateKey) = createKey()
         val privateKS = KeyStore.getInstance("BKS", "BC")
@@ -51,26 +81,6 @@ internal class Signer(
     }
 
     fun signApk(input: File, output: File) {
-        Security.addProvider(BouncyCastleProvider())
-
-        // TODO: keystore should be saved securely
-        val ks = File(signingOptions.keyStoreFilePath)
-        if (!ks.exists()) newKeystore(ks) else {
-            logger.info("Found existing keystore: ${ks.name}")
-        }
-
-        val keyStore = KeyStore.getInstance("BKS", "BC")
-        FileInputStream(ks).use { fis -> keyStore.load(fis, null) }
-        val alias = keyStore.aliases().nextElement()
-
-        val config = ApkSigner.SignerConfig.Builder(
-            signingOptions.cn,
-            keyStore.getKey(alias, passwordCharArray) as PrivateKey,
-            listOf(keyStore.getCertificate(alias) as X509Certificate)
-        ).build()
-
-        val signer = ApkSigner.Builder(listOf(config))
-        signer.setCreatedBy(signingOptions.cn)
         signer.setInputApk(input)
         signer.setOutputApk(output)
 

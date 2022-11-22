@@ -1,21 +1,27 @@
 package app.revanced.cli.command
 
-import app.revanced.cli.aligning.Aligning
 import app.revanced.cli.logging.impl.DefaultCliLogger
-import app.revanced.cli.patcher.Patcher
 import app.revanced.cli.patcher.logging.impl.PatcherLogger
-import app.revanced.cli.signing.Signing
 import app.revanced.cli.signing.SigningOptions
+import app.revanced.patcher.Patcher
 import app.revanced.patcher.PatcherOptions
+import app.revanced.patcher.apk.Apk
+import app.revanced.patcher.apk.ApkBundle
 import app.revanced.patcher.extensions.PatchExtensions.compatiblePackages
 import app.revanced.patcher.extensions.PatchExtensions.description
 import app.revanced.patcher.extensions.PatchExtensions.patchName
+import app.revanced.patcher.patch.PatchResult
 import app.revanced.patcher.util.patch.PatchBundle
 import app.revanced.utils.OptionsLoader
 import app.revanced.utils.adb.Adb
+import app.revanced.utils.filesystem.ZipFileUtils
+import app.revanced.utils.patcher.addPatchesFiltered
+import app.revanced.utils.signing.Signer
+import app.revanced.utils.signing.align.ZipAligner
 import picocli.CommandLine.*
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 
 private class CLIVersionProvider : IVersionProvider {
     override fun getVersion() = arrayOf(
@@ -34,187 +40,392 @@ internal object MainCommand : Runnable {
     @ArgGroup(exclusive = false, multiplicity = "1")
     lateinit var args: Args
 
+    /**
+     * Arguments for the CLI
+     */
     class Args {
-        @Option(names = ["-a", "--apk"], description = ["Input file to be patched"], required = true)
-        lateinit var inputFile: File
-
-        @Option(names = ["--uninstall"], description = ["Uninstall the mount variant"])
-        var uninstall: Boolean = false
+        @Option(names = ["--uninstall"], description = ["Uninstall the mounted apk by its package name"])
+        var uninstall: String? = null
 
         @Option(names = ["-d", "--deploy-on"], description = ["If specified, deploy to adb device with given name"])
         var deploy: String? = null
 
-        @ArgGroup(exclusive = false)
-        var patchArgs: PatchArgs? = null
-    }
-
-    class PatchArgs {
-        @Option(names = ["-b", "--bundles"], description = ["One or more bundles of patches"], required = true)
-        var patchBundles = arrayOf<String>()
-
-        @Option(names = ["--options"], description = ["Configuration file for all patch options"])
-        var options: File = File("options.toml")
-
-        @ArgGroup(exclusive = false)
-        var listingArgs: ListingArgs? = null
-
-        @ArgGroup(exclusive = false)
-        var patchingArgs: PatchingArgs? = null
-    }
-
-    class ListingArgs {
-        @Option(names = ["-l", "--list"], description = ["List patches only"], required = true)
-        var listOnly: Boolean = false
-
-        @Option(names = ["--with-versions"], description = ["List patches with compatible versions"])
-        var withVersions: Boolean = false
-
-        @Option(names = ["--with-packages"], description = ["List patches with compatible packages"])
-        var withPackages: Boolean = false
-
-        @Option(names = ["--with-descriptions"], description = ["List patches with their descriptions"])
-        var withDescriptions: Boolean = true
-    }
-
-    class PatchingArgs {
-        @Option(names = ["-o", "--out"], description = ["Output file path"], required = true)
-        lateinit var outputPath: String
-
-        @Option(names = ["-e", "--exclude"], description = ["Explicitly exclude patches"])
-        var excludedPatches = arrayOf<String>()
-
-        @Option(
-            names = ["--exclusive"],
-            description = ["Only installs the patches you include, not including any patch by default"]
-        )
-        var defaultExclude = false
-
-        @Option(names = ["-i", "--include"], description = ["Include patches"])
-        var includedPatches = arrayOf<String>()
-
-        @Option(names = ["--experimental"], description = ["Disable patch version compatibility patch"])
-        var experimental: Boolean = false
-
-        @Option(names = ["-m", "--merge"], description = ["One or more dex file containers to merge"])
-        var mergeFiles = listOf<File>()
-
         @Option(names = ["--mount"], description = ["If specified, instead of installing, mount"])
         var mount: Boolean = false
 
-        @Option(names = ["--cn"], description = ["Overwrite the default CN for the signed file"])
-        var cn = "ReVanced"
+        @ArgGroup(exclusive = false)
+        var patchArgs: PatchArgs? = null
 
-        @Option(names = ["--keystore"], description = ["File path to your keystore"])
-        var keystorePath: String? = null
+        /**
+         * Arguments for patches.
+         */
+        class PatchArgs {
+            @Option(names = ["-b", "--bundle"], description = ["One or more bundles of patches"], required = true)
+            var patchBundles = arrayOf<String>()
 
-        @Option(names = ["-p", "--password"], description = ["Overwrite the default password for the signed file"])
-        var password = "ReVanced"
+            @ArgGroup(exclusive = false)
+            var listingArgs: ListingArgs? = null
 
-        @Option(names = ["-t", "--temp-dir"], description = ["Temporary resource cache directory"])
-        var cacheDirectory = "revanced-cache"
+            @ArgGroup(exclusive = false)
+            var patchingArgs: PatchingArgs? = null
 
-        @Option(
-            names = ["-c", "--clean"],
-            description = ["Clean the temporary resource cache directory. This will be done anyways when running the patcher"]
-        )
-        var clean: Boolean = false
+            /**
+             * Arguments for patching.
+             */
+            class PatchingArgs {
+                @ArgGroup(exclusive = false, multiplicity = "1")
+                val apkArgs: ApkArgs? = null
 
-        @Option(names = ["--custom-aapt2-binary"], description = ["Path to custom aapt2 binary"])
-        var aaptPath: String = ""
+                @Option(names = ["-o", "--out"], description = ["Output folder path"], required = true)
+                var outputPath: File = File("revanced")
+
+                @Option(names = ["--options"], description = ["Configuration file for all patch options"])
+                var options: File =  outputPath.resolve("options.toml")
+
+                @Option(names = ["-e", "--exclude"], description = ["Explicitly exclude patches"])
+                var excludedPatches = arrayOf<String>()
+
+                @Option(
+                    names = ["--exclusive"],
+                    description = ["Only installs the patches you include, excluding patches by default"]
+                )
+                var defaultExclude = false
+
+                @Option(names = ["-i", "--include"], description = ["Include patches"])
+                var includedPatches = arrayOf<String>()
+
+                @Option(names = ["--experimental"], description = ["Disable patch version compatibility patch"])
+                var experimental: Boolean = false
+
+                @Option(names = ["-m", "--merge"], description = ["One or more dex file containers to merge"])
+                var mergeFiles = listOf<File>()
+
+                @Option(names = ["--cn"], description = ["Overwrite the default CN for the signed file"])
+                var cn = "ReVanced"
+
+                @Option(names = ["--keystore"], description = ["File path to your keystore"])
+                var keystorePath: String? = null
+
+                @Option(
+                    names = ["-p", "--password"],
+                    description = ["Overwrite the default password for the signed file"]
+                )
+                var password = "ReVanced"
+
+                @Option(names = ["-t", "--temp-dir"], description = ["Temporary work directory"])
+                var workDirectory = File("revanced-cache")
+
+                @Option(
+                    names = ["-c", "--clean"],
+                    description = ["Clean the temporary work directory. This will always be done before running the patcher"]
+                )
+                var clean: Boolean = false
+
+                @Option(names = ["--custom-aapt2-binary"], description = ["Path to custom aapt2 binary"])
+                var aaptPath: String = ""
+
+                @Option(
+                    names = ["--low-storage"],
+                    description = ["Minimizes storage usage by trying to cache as little as possible"]
+                )
+                var lowStorage: Boolean = false
+
+                /**
+                 * Arguments for [Apk] files.
+                 */
+                class ApkArgs {
+                    @Option(
+                        names = ["-a", "--base-apk"],
+                        description = ["The base apk file that is to be patched"],
+                        required = true
+                    )
+                    lateinit var baseApk: String
+
+                    @ArgGroup(exclusive = false)
+                    val splitsArgs: SplitsArgs? = null
+
+                    class SplitsArgs {
+                        @Option(
+                            names = ["--language-apk"],
+                            description = ["Additional split apk file which contains language files"], required = true
+                        )
+                        lateinit var languageApk: String
+
+                        @Option(
+                            names = ["--library-apk"],
+                            description = ["Additional split apk file which contains libraries"], required = true
+                        )
+                        lateinit var libraryApk: String
+
+                        @Option(
+                            names = ["--asset-apk"],
+                            description = ["Additional split apk file which contains assets"], required = true
+                        )
+                        lateinit var assetApk: String
+                    }
+                }
+            }
+
+            /**
+             * Arguments for printing patches.
+             */
+            class ListingArgs {
+                @Option(names = ["-l", "--list"], description = ["List patches only"], required = true)
+                var listOnly: Boolean = false
+
+                @Option(names = ["--with-versions"], description = ["List patches with compatible versions"])
+                var withVersions: Boolean = false
+
+                @Option(names = ["--with-packages"], description = ["List patches with compatible packages"])
+                var withPackages: Boolean = false
+
+                @Option(names = ["--with-descriptions"], description = ["List patches with their descriptions"])
+                var withDescriptions: Boolean = true
+            }
+        }
     }
 
     override fun run() {
+        // other types of commands
+        // TODO: convert this code to picocli subcommands
         if (args.patchArgs?.listingArgs?.listOnly == true) return printListOfPatches()
-        if (args.uninstall) return uninstall()
+        if (args.uninstall != null) return uninstall()
 
-        val pArgs = this.args.patchArgs?.patchingArgs ?: return
-        val outputFile = File(pArgs.outputPath) // the file to write to
+        // patching commands require these arguments
+        val patchArgs = this.args.patchArgs ?: return
+        val patchingArgs = patchArgs.patchingArgs ?: return
 
-        val allPatches = args.patchArgs!!.patchBundles.flatMap { bundle ->
-            PatchBundle.Jar(bundle).loadPatches()
+        // prepare the work directory, delete it if it already exists
+        val workDirectory = patchingArgs.workDirectory.also {
+            if (!it.deleteRecursively())
+                return logger.error("Failed to delete work directory")
         }
 
-        OptionsLoader.init(args.patchArgs!!.options, allPatches)
+        // prepare apks
+        val apkArgs = patchingArgs.apkArgs!!
 
-        val patcher = app.revanced.patcher.Patcher(
+        val baseApk = Apk.Base(apkArgs.baseApk)
+        val splitApk = apkArgs.splitsArgs?.let { args ->
+            with(args) {
+                ApkBundle.Split(
+                    Apk.Split.Library(libraryApk),
+                    Apk.Split.Asset(assetApk),
+                    Apk.Split.Language(languageApk)
+                )
+            }
+        }
+
+        // prepare patches
+        val allPatches = patchArgs.patchBundles.flatMap { bundle -> PatchBundle.Jar(bundle).loadPatches() }.also {
+            OptionsLoader.init(patchingArgs.options, it)
+        }
+
+        // prepare the patcher
+        val patcher = Patcher( // constructor decodes base
             PatcherOptions(
-                args.inputFile.also { if (!it.exists()) return logger.error("Input file ${args.inputFile} does not exist.") },
-                pArgs.cacheDirectory,
-                pArgs.aaptPath,
-                pArgs.cacheDirectory,
+                ApkBundle(baseApk, splitApk),
+                workDirectory.path,
+                patchingArgs.aaptPath,
+                workDirectory.path,
                 PatcherLogger
             )
         )
 
         // prepare adb
-        val adb: Adb? = args.deploy?.let {
-            Adb(outputFile, patcher.context.packageMetadata.packageName, args.deploy!!, !pArgs.mount)
+        val adb: Adb? = args.deploy?.let { device ->
+            if (args.mount) {
+                Adb.RootAdb(device, logger)
+            } else {
+                Adb.UserAdb(device, logger)
+            }
         }
 
-        val patchedFile = File(pArgs.cacheDirectory).resolve("${outputFile.nameWithoutExtension}_raw.apk")
+        with(workDirectory.resolve("cli")) {
+            val patched = resolve("patched")
+            val alignedDirectory = resolve("aligned").also(File::mkdirs)
+            val signedDirectory = resolve("signed").also(File::mkdirs)
 
-        // start the patcher
-        Patcher.start(patcher, patchedFile, allPatches)
 
-        val cacheDirectory = File(pArgs.cacheDirectory)
+            /**
+             * Clean up a temporal directory.
+             *
+             * @param directory The directory to clean up.
+             */
+            fun delete(directory: File, force: Boolean = false) {
+                if (!force && !patchingArgs.lowStorage) return
+                if (!directory.deleteRecursively())
+                    return logger.error("Failed to delete directory $directory")
+            }
 
-        // align the file
-        val alignedFile = cacheDirectory.resolve("${outputFile.nameWithoutExtension}_aligned.apk")
-        Aligning.align(patchedFile, alignedFile)
+            /**
+             * Creates the [Apk] file with the patches resources.
+             *
+             * @param apk The [Apk] file to write.
+             * @return The new patched [Apk] file.
+             */
+            fun writeToNewApk(apk: Apk): File {
+                /**
+                 * Writes the [Apk] patch to the file specified.
+                 *
+                 * @param file The file to copy to.
+                 */
+                fun writeToFile(file: File) {
+                    ZipFileUtils(file).use { apkFileSystem ->
+                        // copy resources for that apk to the cached apk
+                        apk.resources?.let { apkResources ->
+                            logger.info("Creating new resources to new $apk apk file")
+                            ZipFileUtils(apkResources).use { resourcesFileStream ->
+                                // get the resources from the resources file and write them to the cached apk
+                                val resourceFiles = resourcesFileStream.getFsPath(File.separator)
+                                apkFileSystem.write(resourceFiles)
+                            }
 
-        // sign the file
-        val finalFile = if (!pArgs.mount) {
-            val signedOutput = cacheDirectory.resolve("${outputFile.nameWithoutExtension}_signed.apk")
-            Signing.sign(
-                alignedFile,
-                signedOutput,
-                SigningOptions(
-                    pArgs.cn,
-                    pArgs.password,
-                    pArgs.keystorePath ?: outputFile.absoluteFile.parentFile
-                        .resolve("${outputFile.nameWithoutExtension}.keystore")
-                        .canonicalPath
-                )
-            )
+                            // store resources which are doNotCompress
+                            // TODO(perf): make FileSystemUtils compress by default
+                            //  by using app.revanced.utils.signing.align.zip.ZipFile
+                            apk.packageMetadata.doNotCompress?.forEach(apkFileSystem::decompress)
+                        }
 
-            signedOutput
-        } else
-            alignedFile
+                        // copy dex files for that apk to the cached apk, if it is a base apk
+                        if (apk is Apk.Base) {
+                            logger.info("Writing dex files for $apk apk file")
+                            apk.dexFiles.forEach { dexFile ->
+                                apkFileSystem.write(dexFile.name, dexFile.stream.readAllBytes())
+                            }
+                        }
+                    }
+                }
 
-        // finally copy to the specified output file
-        logger.info("Copying ${finalFile.name} to ${outputFile.name}")
-        finalFile.copyTo(outputFile, overwrite = true)
+                return patched.resolve(apk.file.name) // no need to mkdirs, because copyTo will create the path
+                    .also { apk.file.copyTo(it) } // write a copy of the original file
+                    .also(::writeToFile) // write patches to that file
+            }
 
-        // clean up the cache directory if needed
-        if (pArgs.clean)
-            cleanUp(pArgs.cacheDirectory)
+            /**
+             * Alin the raw [Apk] file.
+             *
+             * @param unalignedApkFile The apk file to align.
+             * @return The aligned [Apk] file.
+             */
+            fun alignApk(unalignedApkFile: File): File {
+                logger.info("Aligning ${unalignedApkFile.name}")
+                return alignedDirectory.resolve(unalignedApkFile.name)
+                    .also { alignedApk -> ZipAligner.align(unalignedApkFile, alignedApk) }
+            }
 
-        // deploy if specified
-        adb?.deploy()
+            /**
+             * Sign a list of [Apk] files.
+             *
+             * @param unsignedApks The list of [Apk] files to sign.
+             * @return The list of signed [Apk] files.
+             */
+            fun signApks(unsignedApks: List<File>) = if (!args.mount) {
+                with(Signer(
+                    SigningOptions(
+                        patchingArgs.cn,
+                        patchingArgs.password,
+                        patchingArgs.keystorePath
+                            ?: patchingArgs.outputPath.absoluteFile.resolve("${baseApk.file.nameWithoutExtension}.keystore").canonicalPath
+                    )
+                )){
+                    unsignedApks.map { unsignedApk -> // sign the unsigned apk
+                        logger.info("Signing ${unsignedApk.name}")
+                        signedDirectory.resolve(unsignedApk.name)
+                            .also { signedApk ->
+                                signApk(
+                                    unsignedApk, signedApk
+                                )
+                            }
+                    }
+                }
+            } else {
+                unsignedApks
+            }
 
-        if (pArgs.clean && args.deploy != null) Files.delete(outputFile.toPath())
+            /**
+             * Copy an [Apk] file to the output directory.
+             *
+             * @param apk The [Apk] file to copy.
+             * @return The copied [Apk] file.
+             */
+            fun copyToOutput(apk: File): File {
+                logger.info("Copying ${apk.name} to output directory")
 
-        logger.info("Finished")
-    }
+                return patchingArgs.outputPath.resolve(apk.name).also {
+                    Files.copy(apk.toPath(), it.toPath(), StandardCopyOption.REPLACE_EXISTING)
+                }
+            }
 
-    private fun cleanUp(cacheDirectory: String) {
-        val result = if (File(cacheDirectory).deleteRecursively())
-            "Cleaned up cache directory"
-        else
-            "Failed to clean up cache directory"
-        logger.info(result)
+            /**
+             * Install an [Apk] file to the device.
+             *
+             * @param apkFiles The [Apk] files to install.
+             * @return The input [Apk] file.
+             */
+            fun install(apkFiles: List<Pair<File, Apk>> /* pair of the apk file and the apk */) =
+                apkFiles.also {
+                    adb?.let { adb ->
+                        fun Pair<File, Apk>.intoAdbApk() = Adb.Apk(this.first.path)
+
+                        val base = it.find { (_, apk) -> apk is Apk.Base }!!.let(Pair<File, Apk>::intoAdbApk)
+                        val splits = it.filter { (_, apk) -> apk is Apk.Split }.map(Pair<File, Apk>::intoAdbApk)
+
+                        adb.install(base, splits)
+                    }
+                }.map { (outputApk, _) -> outputApk }
+
+            /**
+             * Clean up the work directory and output files.
+             *
+             * @param outputApks The list of output [Apk] files.
+             */
+            fun cleanUp(outputApks: List<File>) {
+                // clean up the work directory if needed
+                if (patchingArgs.clean) {
+                    delete(patchingArgs.workDirectory, true)
+                    if (args.deploy?.let { outputApks.any { !it.delete() } } == true)
+                        logger.error("Failed to delete some output files")
+                }
+            }
+
+            /**
+             * Run the patcher and save the patched resources
+             *
+             * @return The resulting patched [Apk] files.
+             */
+            fun Patcher.run() = also {
+                addFiles(patchingArgs.mergeFiles) { file ->
+                    logger.info("Merging $file")
+                }
+
+                addPatchesFiltered(allPatches, baseApk)
+
+                this.executePatches().forEach { (patch, result) ->
+                    if (result is PatchResult.Error) logger.error("$patch failed:\n${result.stackTraceToString()}")
+                    else logger.info("$patch succeeded")
+                }
+            }.save().apkFiles.map { it.apk }
+
+            with(patcher.run()) {
+                map(::writeToNewApk)
+                    .map(::alignApk).also { delete(patched) }
+                    .also { patchingArgs.outputPath.also(File::mkdirs) } // from now on this directory is required
+                    .let(::signApks).also { delete(alignedDirectory) }
+                    .map(::copyToOutput).also { delete(signedDirectory) }.zip(this)
+                    .let(::install)
+                    .let(::cleanUp)
+            }
+
+            logger.info("Finished")
+        }
     }
 
     private fun uninstall() {
-        val adb: Adb? = args.deploy?.let {
-            Adb(
-                File("placeholder_file"),
-                app.revanced.patcher.Patcher(PatcherOptions(args.inputFile, "")).context.packageMetadata.packageName,
-                args.deploy!!,
-                false
-            )
+        args.uninstall?.let { packageName ->
+            args.deploy?.let { device ->
+                Adb.UserAdb(device, logger).uninstall(packageName)
+            } ?: return logger.error("You must specify a device to uninstall from")
         }
-        adb?.uninstall()
     }
 
     private fun printListOfPatches() {
