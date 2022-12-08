@@ -1,3 +1,5 @@
+## [2.16.2-dev.2](https://github.com/revanced/revanced-cli/compare/v2.16.2-dev.1...v2.16.2-dev.2) (2022-12-08)
+
 ## [2.16.2-dev.1](https://github.com/revanced/revanced-cli/compare/v2.16.1...v2.16.2-dev.1) (2022-12-05)
 
 ## [2.16.1](https://github.com/revanced/revanced-cli/compare/v2.16.0...v2.16.1) (2022-11-22)
